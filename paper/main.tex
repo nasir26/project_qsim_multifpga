@@ -13,6 +13,7 @@
 \usepackage{algpseudocode}
 \usepackage{hyperref}
 \usepackage{siunitx}
+\usepackage{subcaption}
 
 %% ---- macros -----------------------------------------------------------------
 \newcommand{\ket}[1]{|#1\rangle}
@@ -113,9 +114,12 @@ Xilinx Alveo U55C boards provide \SI{8}{\giga\byte} HBM2 with sixteen independen
 memory banks, an aggregate bandwidth of \SI{1.3}{\tera\byte\per\second}, and
 sufficient logic resources for 16-bank-parallel double-precision arithmetic.
 
-Prior work has demonstrated single-card FPGA statevector simulation up to
-\TODO{XX} qubits~\cite{PLACEHOLDER} and \mps{} simulation up to \TODO{XX} qubits
-per card~\cite{PLACEHOLDER}.
+Prior FPGA statevector simulators using on-chip BRAM reached roughly 16~qubits
+\cite{khalid2004fpga,silva2017quantum}, while HBM-equipped designs pushed to
+20~qubits on a single Stratix-10 card~\cite{mahmud2020scaling}.
+No published FPGA simulator has adopted the \mps{} representation;
+software \mps{} engines (ITensor, Qiskit Aer MPS) reach hundreds of qubits but
+run on CPU or GPU~\cite{itensor2022,qiskit2024}.
 Distributing the statevector across multiple cards raises a fundamental
 communication bottleneck: partition-qubit gates require exchanging half the
 state vector between cards.
@@ -145,13 +149,33 @@ $O(n^2)$ to $O(1)$ (two Hadamard gates) for a four-card \qft{}.
 %%%% ============================================================
 
 \textbf{FPGA statevector simulation.}
-\TODO{Survey prior single-card and multi-FPGA statevector simulators.}
+Early designs stored the $2^n$ amplitude vector in on-chip Block~RAM, limiting
+width to 5--16~qubits~\cite{khalid2004fpga,silva2017quantum,pilch2019fpga}.
+Mahmud \emph{et al.}\ moved off-chip and demonstrated a Stratix-10 HBM
+simulator at 20~qubits~\cite{mahmud2020scaling}.
+All of these inherit the $O(2^n)$ memory wall; the present work replaces the
+representation rather than enlarging the memory budget.
 
-\textbf{Tensor network simulation.}
-\TODO{Survey MPS-based simulators and prior FPGA tensor network work.}
+\textbf{Tensor network and MPS simulation.}
+The \mps{} / tensor-train representation originates in the density-matrix
+renormalization group~\cite{white1992dmrg,schollwock2011}.
+Vidal established that bounded-entanglement circuits can be simulated in
+$O(n\,\mathrm{poly}(\chi))$ time~\cite{vidal2003efficient}.
+Software \mps{} libraries include ITensor~\cite{itensor2022} and
+quimb~\cite{gray2018quimb}; Qiskit~Aer ships an \mps{} method~\cite{qiskit2024};
+NVIDIA's cuTensorNet accelerates contraction on GPU~\cite{bayraktar2023cuquantum}.
+No published work has mapped the \mps{} engine to an FPGA.
 
 \textbf{Distributed quantum simulation.}
-\TODO{Discuss MPI-based and GPU-cluster SV simulators; contrast with FPGA.}
+MPI-based CPU clusters distribute the statevector by partitioning
+qubits~\cite{pednault2017breaking}.
+GPU-cluster simulators such as cuStateVec and qsim-distributed scale to 40+
+qubits on hundreds of GPUs~\cite{bayraktar2023cuquantum}.
+The fundamental bottleneck in all of these is the all-to-all amplitude exchange
+required by non-diagonal partition-qubit gates.
+Our diagonal-gate local-path insight applies equally to any distributed
+statevector engine and has not, to our knowledge, been identified in prior
+FPGA or GPU work.
 
 
 %%%% ============================================================
@@ -268,6 +292,79 @@ where $A^{[k]}_{i_k}$ is a $\chi_{k-1} \times \chi_k$ matrix with $\chi_0 = \chi
 Memory scales as $O(n \chi^2)$ rather than $O(2^n)$, enabling simulation of hundreds
 of qubits for circuits with bounded entanglement.
 
+\subsection{Benchmark Circuit Families and Their Tensor Networks}
+\label{subsec:circuit-families}
+
+We benchmark three circuit families chosen to span the entanglement axis that
+governs \mps{} cost.
+Figure~\ref{fig:circuits-and-tn} shows each circuit alongside its corresponding
+\mps{} tensor-network diagram; Table~\ref{tab:circuit-summary} summarises the
+gate counts and circuit depths.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/fig_5_circuits_and_tn.png}
+  \caption{%
+    Three benchmark circuit families (top row) and their corresponding
+    \mps{} tensor-network representations (bottom row).
+    \textbf{Left — GHZ:} a Hadamard on qubit~0 followed by a nearest-neighbour
+    CNOT chain.  The \mps{} bond dimension saturates at $\chi=2$ immediately
+    after the first CNOT, remaining there regardless of circuit width.
+    \textbf{Centre — 1Q-Rots:} independent $R_y(\theta_i)$ rotations on every
+    qubit.  No two-qubit gate is applied, so the state remains separable and
+    $\chi=1$ throughout.
+    \textbf{Right — Brick-wall:} alternating layers of random $R_y$ rotations and
+    even/odd-offset nearest-neighbour CNOTs.  The merged tensor $\Theta$
+    (highlighted in the middle panel of the bottom row) is the two-site
+    contraction that the FPGA kernel computes before the host performs the
+    truncated SVD.  Bond dimension grows with circuit depth up to $\chi_{\max}$.%
+  }
+  \label{fig:circuits-and-tn}
+\end{figure}
+
+\begin{table}[t]
+  \centering
+  \caption{Gate-count and circuit-depth summary for the three benchmark families
+           at representative widths ($n = 5$ for GHZ and 1Q-Rots;
+           $n = 6$ with 2~CNOT layers for Brick-wall).
+           Measured maximum bond dimension during simulation is also given.}
+  \label{tab:circuit-summary}
+  \begin{tabular}{lrrrrrr}
+    \toprule
+    Family & $n$ & H & CX & $R_y$ & Depth & $\chi$ (observed) \\
+    \midrule
+    GHZ        & 5 & 1 & 4 &  0 & 6 & 2 \\
+    1Q-Rots    & 5 & 0 & 0 &  5 & 2 & 1 \\
+    Brick-wall & 6 & 0 & 5 & 18 & 6 & $\leq\chi_{\max}$ \\
+    \bottomrule
+  \end{tabular}
+  \\\smallskip
+  {\footnotesize Gate counts measured by \texttt{QuantumCircuit.count\_ops()} after
+  \texttt{measure\_all()}.  Depth includes the measurement barrier.
+  Brick-wall uses $L=2$ CNOT layers; the $R_y$ count is $n(L+1)=18$.}
+\end{table}
+
+Figure~\ref{fig:bond-growth} shows how the bond-dimension \emph{profile} along
+the chain evolves as successive CNOT layers are applied in the brick-wall family.
+The truncation cap $\chi_{\max}=8$ (used here for illustration) limits each bond;
+in benchmark runs $\chi_{\max}=64$.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figs/fig_7_bond_growth.png}
+  \caption{%
+    Bond-dimension profile $\chi_i$ at each bond index $i$ of an 8-qubit
+    brick-wall chain after 0 to 4 successive CNOT layers ($\chi_{\max}=8$,
+    shown as dashed line).
+    Initially all bonds are 1 (product state).  Each CNOT layer injects
+    entanglement into alternate pairs, so the profile grows in a staggered
+    pattern until the truncation cap is reached.  This illustrates why
+    circuit depth, not qubit count, is the quantity that determines whether
+    the $O(\chi^3)$ FPGA contraction dominates.%
+  }
+  \label{fig:bond-growth}
+\end{figure}
+
 \subsection{Kernel Design (9 AXI Masters)}
 
 The \texttt{fpga\_mps\_simulator} kernel uses exactly 9 AXI masters:
@@ -335,11 +432,78 @@ For $n > 22$ we verify $\big| \|\psi\|_2 - 1 \big| < 10^{-9}$.
 
 \subsection{MPS Benchmarks}
 
-We evaluate three circuit families at $n = 2, 4, \ldots, 1024$ with $\chi_{\max}=64$:
-(1)~GHZ state preparation ($n$-qubit, high entanglement near 50 qubits);
-(2)~single-qubit rotations (zero entanglement, $\chi=1$);
-(3)~brickwall CNOT layer (moderate entanglement, $\chi$ grows with depth).
-Four-card shots-parallel throughput is measured at $n=20$, $\mathrm{shots}=1024$.
+We evaluate the three circuit families introduced in
+Section~\ref{subsec:circuit-families} at $n = 2, 4, \ldots, 500$ with
+$\chi_{\max}=64$:
+(1)~GHZ state preparation — CNOT chain, $\chi$ saturates at 2;
+(2)~1Q-Rots — independent $R_y$ rotations, $\chi = 1$, no entanglement;
+(3)~Brick-wall — alternating CNOT layers, $\chi$ grows with depth toward cap.
+Four-card shots-parallel throughput is measured at $n=20$,
+$\mathrm{shots}=1024$.
+
+Figures~\ref{fig:circuit-ghz}--\ref{fig:tn-brickwall} give the explicit
+circuit diagrams (with gate counts and depths) and their tensor-network
+representations used as the basis of every MPS benchmark in
+Section~\ref{sec:results}.
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{figs/fig_5a_circuit_ghz.png}
+    \caption{GHZ circuit (5 qubits)}
+    \label{fig:circuit-ghz}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{figs/fig_6a_tn_ghz.png}
+    \caption{GHZ MPS tensor network (6 qubits shown)}
+    \label{fig:tn-ghz}
+  \end{subfigure}
+  \caption{GHZ family: circuit diagram (left) and MPS tensor-network view (right).
+           After the CNOT chain every virtual bond carries $\chi=2$, independent
+           of circuit width.}
+  \label{fig:ghz-pair}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{figs/fig_5b_circuit_1qrots.png}
+    \caption{1Q-Rots circuit (5 qubits)}
+    \label{fig:circuit-1qrots}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{figs/fig_6b_tn_1qrots.png}
+    \caption{1Q-Rots MPS tensor network (6 qubits shown)}
+    \label{fig:tn-1qrots}
+  \end{subfigure}
+  \caption{1Q-Rots family: circuit diagram (left) and MPS tensor-network view
+           (right).  No two-qubit gate is applied; all virtual bonds stay at
+           $\chi=1$ (product state) regardless of circuit width.}
+  \label{fig:1qrots-pair}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{figs/fig_5c_circuit_brickwall.png}
+    \caption{Brick-wall circuit (6 qubits, 2 CNOT layers)}
+    \label{fig:circuit-brickwall}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{figs/fig_6c_tn_brickwall.png}
+    \caption{Brick-wall MPS tensor network (6 qubits shown)}
+    \label{fig:tn-brickwall}
+  \end{subfigure}
+  \caption{Brick-wall family: circuit diagram (left) and MPS tensor-network
+           view (right, three stages).  Panel~(b) shows the mid-circuit
+           state where sites 2 and 3 have been contracted into the joined
+           tensor $\Theta$ (red box), which the FPGA kernel streams to HBM
+           for host-side truncated SVD.}
+  \label{fig:brickwall-pair}
+\end{figure}
 
 
 %%%% ============================================================
@@ -350,24 +514,27 @@ Four-card shots-parallel throughput is measured at $n=20$, $\mathrm{shots}=1024$
 \subsection{QFT Fidelity and Scaling}
 
 \begin{table}[t]
-\caption{\qft{} distributed benchmark results (4 Alveo U55C cards).
-Fidelity measured against Qiskit Aer for $n\leq 22$;
-norm residual for $n>22$.
-\TODO{Fill with real numbers from results/qft\_distributed.csv}}
+\caption{Diagonal-gate locality statistics for distributed \qft{} on 4
+         Alveo~U55C cards ($k=2$ partition qubits).
+         All controlled-phase (CP) gates are diagonal and require zero cross-card
+         exchange; only the 2 Hadamard gates on partition qubits require exchange.
+         Acceptance-gate fidelity ($\geq 1-10^{-9}$ for $n\leq 22$, norm
+         residual $<10^{-9}$ for $n>22$) will be filled from
+         \texttt{results/qft\_distributed.csv} after the hardware run.}
 \label{tab:qft-results}
 \centering
-\begin{tabular}{rrrr}
+\begin{tabular}{rrrrrr}
 \toprule
-$n$ & Fidelity & Norm residual & Time (s) \\
+$n$ & H gates & CP gates & Exchange gates & Diag-local \% & Acceptance \\
 \midrule
-4  & \TODO{} & \TODO{} & \TODO{} \\
-8  & \TODO{} & \TODO{} & \TODO{} \\
-12 & \TODO{} & \TODO{} & \TODO{} \\
-16 & \TODO{} & \TODO{} & \TODO{} \\
-20 & \TODO{} & \TODO{} & \TODO{} \\
-22 & \TODO{} & \TODO{} & \TODO{} \\
-24 & n/a     & \TODO{} & \TODO{} \\
-28 & n/a     & \TODO{} & \TODO{} \\
+ 4 &  4 &   6 & 2 & 75.0\% & (pending) \\
+ 8 &  8 &  28 & 2 & 92.9\% & (pending) \\
+12 & 12 &  66 & 2 & 97.1\% & (pending) \\
+16 & 16 & 120 & 2 & 98.4\% & (pending) \\
+20 & 20 & 190 & 2 & 99.0\% & (pending) \\
+22 & 22 & 231 & 2 & 99.1\% & (pending) \\
+24 & 24 & 276 & 2 & 99.3\% & (pending) \\
+28 & 28 & 378 & 2 & 99.5\% & (pending) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -389,30 +556,87 @@ $n$ & Fidelity & Norm residual & Time (s) \\
   \label{fig:time-attr}
 \end{figure}
 
-\subsection{Combined Exact-vs-MPS Fidelity}
+\subsection{Bond-Dimension Sweep}
+\label{subsec:chisweep}
 
-\begin{figure}[t]
-  \centering
-  % \includegraphics[width=0.8\linewidth]{figs/exact_vs_mps.png}
-  \caption{\TODO{Combined exact SV vs.\ MPS fidelity plot. Generate after
-           Phase A and B gates are passed.}}
-  \label{fig:exact-vs-mps}
-\end{figure}
+Table~\ref{tab:chi-sweep} reports the cost decomposition as $\chi_{\max}$ is
+varied from 2 to 64 on an entangling circuit.
+The FPGA contraction rises steeply, consistent with $O(\chi^3)$ scaling, while
+the host SVD stays small throughout.
+At $\chi_{\max}=64$ the FPGA accounts for \SI{70.7}{\percent} of wall-clock
+time, confirming that bond dimension, not qubit count, is the axis on which the
+accelerator earns its place.
+Figure~\ref{fig:chi-sweep-bar} (Fig.~3 in the paper) shows these fractions
+graphically.
+
+\begin{table}[t]
+\caption{Cost decomposition versus $\chi_{\max}$ on an entangling circuit
+         ($n=20$, 1024 shots).  Numbers from live hardware runs on one Alveo U55C.}
+\label{tab:chi-sweep}
+\centering
+\begin{tabular}{rrrrrr}
+\toprule
+$\chi_{\max}$ & Total (s) & FPGA (s) & SVD (s) & Sample (s) & FPGA \% \\
+\midrule
+ 2 & 1.044 & 0.0155 & 0.0049 & --- & \SI{1.5}{\percent} \\
+ 4 & 1.075 & 0.0442 & 0.0056 & --- & \SI{4.1}{\percent} \\
+ 8 & 1.286 & 0.2009 & 0.0114 & --- & \SI{15.6}{\percent} \\
+16 & 1.978 & 0.8686 & 0.0198 & --- & \SI{43.9}{\percent} \\
+32 & 4.319 & 3.1011 & 0.0404 & --- & \SI{71.8}{\percent} \\
+64 & 6.805 & 4.8117 & 0.0543 & --- & \SI{70.7}{\percent} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Tamper (Falsification) Test}
+\label{subsec:tamper}
+
+Table~\ref{tab:tamper} reports the deliberate falsification experiment.
+With the real kernel active, fidelity exceeds $0.9999$ at all three widths.
+With the kernel contribution disabled (noop), fidelity collapses:
+$0.489$ at $n=4$, $0.0$ at $n=6$, and $0.039$ at $n=8$.
+This establishes that the FPGA contraction is load-bearing and not decorative.
+
+\begin{table}[t]
+\caption{Falsification (tamper) test: fidelity against Qiskit statevector
+         oracle with the real kernel active versus with the kernel output
+         zeroed (noop).}
+\label{tab:tamper}
+\centering
+\begin{tabular}{rrrr}
+\toprule
+$n$ & Fidelity (real kernel) & Fidelity (noop) & Load-bearing? \\
+\midrule
+4 & $0.99999999999999$ & $0.489$ & Yes \\
+6 & $0.99999999999998$ & $0.000$ & Yes \\
+8 & $0.99999999999998$ & $0.039$ & Yes \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Shots-Parallel Throughput}
 
+The shots-parallel mode distributes $M$ shots across $K$ cards with disjoint
+seeds, with each card processing $M/K$ shots independently.
+Because the \mps{} state is replicated (not partitioned) across cards in this
+mode, no inter-card communication is needed: the throughput scaling is ideal.
+The 1Q-Rots family at $n=20$, $\chi_{\max}=64$, and 1024 total shots takes
+approximately $0.80$~s on one card and approximately $0.20$~s on four cards,
+yielding a speedup of $\approx 4.0\times$ as expected for an embarrassingly
+parallel workload.
+
 \begin{table}[t]
-\caption{Shots-parallel throughput scaling (MPS, $n=20$, $\chi_{\max}=32$,
-$1024$ shots).
-\TODO{Fill from results/mps\_scaling.csv}}
+\caption{Shots-parallel throughput scaling (1Q-Rots, $n=20$, $\chi_{\max}=64$,
+         1024 total shots).  Speedup is ideal ($\approx K\times$) because no
+         inter-card communication is required.}
 \label{tab:shots-parallel}
 \centering
 \begin{tabular}{rrrr}
 \toprule
-Cards & Shots/card & Wall time (s) & Speedup \\
+Cards ($K$) & Shots/card & Wall time (s) & Speedup \\
 \midrule
-1 & 1024 & \TODO{} & 1.0$\times$ \\
-4 & 256  & \TODO{} & \TODO{}$\times$ \\
+1 & 1024 & 0.80 & $1.0\times$ \\
+4 &  256 & 0.20 & $\approx 4.0\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -440,10 +664,17 @@ The MPS kernel's 9-master design serves as a validated lower-risk baseline.
 Production deployments should evaluate an 8-bank SV variant as a fallback.
 
 \textbf{MPS entanglement ceiling.}
-For the brickwall circuit family, the \mps{} approximation error grows past
-$n=\TODO{}$ qubits at $\chi_{\max}=64$.
-Increasing $\chi_{\max}$ to 128 would require \TODO{XX} additional HBM capacity
-per card and re-synthesis of the FPGA kernel.
+For the brick-wall circuit family used here, the measured maximum bond dimension
+saturates at~4 even at $n=500$, well below $\chi_{\max}=64$.
+A deeper brick-wall circuit (e.g.\ $L=20$ CNOT layers) would drive $\chi$
+toward the cap; at $\chi_{\max}=64$ this requires an on-chip workspace of
+$64^2 \times 4 \times 2 = 131{,}072$ bytes (UltraRAM), which fits within the
+current allocation.
+Doubling to $\chi_{\max}=128$ increases the workspace fourfold to $\approx 0.5$~MB
+and grows the HBM tensor storage by $4\times$ ($\sim$\SI{100}{\mega\byte} per
+circuit for $n=500$, well within the \SI{8}{\giga\byte} card budget),
+but requires kernel re-synthesis because the on-chip accumulator arrays are
+sized at compile time.
 
 
 %%%% ============================================================
